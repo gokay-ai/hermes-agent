@@ -3586,6 +3586,39 @@ def set_runtime_main(
     return token
 
 
+def sync_runtime_main_from_agent(agent) -> Optional[contextvars.Token]:
+    """Refresh the auxiliary snapshot from a live AIAgent.
+
+    ``restore_primary_runtime`` updates ``agent.provider`` / ``agent.model``
+    (and the matching credential fields) without going through
+    ``turn_context``'s ``set_runtime_main`` call. Auxiliary auto-detect reads
+    the context-local snapshot, so it must be rebound here or a restored
+    session keeps routing vision to the stale fallback provider (#96924).
+
+    Preserves an existing ``cache_scope`` / ``session_id`` when the agent has
+    not resolved a new one yet, so a mid-session restore does not wipe the
+    turn's prompt-cache key.
+    """
+    current = _RUNTIME_MAIN_CONTEXT.get()
+    cache_scope = ""
+    session_id = getattr(agent, "session_id", "") or ""
+    if isinstance(current, dict):
+        cache_scope = str(current.get("cache_scope") or "")
+        if not session_id:
+            session_id = str(current.get("session_id") or "")
+    return set_runtime_main(
+        getattr(agent, "provider", "") or "",
+        getattr(agent, "model", "") or "",
+        requested_provider=getattr(agent, "requested_provider", "") or "",
+        base_url=getattr(agent, "base_url", "") or "",
+        api_key=getattr(agent, "api_key", "") or "",
+        api_mode=getattr(agent, "api_mode", "") or "",
+        auth_mode=getattr(agent, "auth_mode", "") or "",
+        session_id=session_id,
+        cache_scope=cache_scope,
+    )
+
+
 def reset_runtime_main(token: contextvars.Token) -> None:
     """Restore the runtime binding that preceded one scoped turn."""
     if token is None:
@@ -4076,6 +4109,25 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
         if isinstance(identity, str):
             normalized[identity_field] = identity.lower()
     return normalized
+
+
+def _coherent_main_identity(runtime: Dict[str, Any]) -> Tuple[str, str]:
+    """Return ``(provider, model)`` from one source, never a mixed pair.
+
+    A live runtime snapshot is an atomic identity: if either half is
+    present, both halves come from that snapshot (a missing half stays
+    empty). Config.yaml / ``_read_main_*`` are consulted only when the
+    runtime has neither field, so a stale fallback provider cannot pair
+    with a restored or configured model from a different source (#96924).
+    """
+    provider = str(runtime.get("provider") or "").strip()
+    model = str(runtime.get("model") or "").strip()
+    if provider or model:
+        return provider, model
+    return (
+        str(_read_main_provider() or "").strip(),
+        str(_read_main_model() or "").strip(),
+    )
 
 
 def _get_provider_chain() -> List[tuple]:
@@ -5989,7 +6041,6 @@ def _resolve_auto_route(
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
     runtime = _normalize_main_runtime(main_runtime)
     runtime_provider = runtime.get("provider", "")
-    runtime_model = str(runtime.get("model") or "")
     runtime_base_url = str(runtime.get("base_url") or "")
     runtime_api_key = runtime.get("api_key", "")
     runtime_api_mode = str(runtime.get("api_mode") or "")
@@ -6020,8 +6071,7 @@ def _resolve_auto_route(
     # on aggregators (OpenRouter, Nous) who previously got routed to a
     # cheap provider-side default.  Explicit per-task overrides set via
     # config.yaml (auxiliary.<task>.provider) still win over this.
-    main_provider = str(runtime_provider or _read_main_provider() or "")
-    main_model = str(runtime_model or _read_main_model() or "")
+    main_provider, main_model = _coherent_main_identity(runtime)
 
     # Latency-critical tasks can explicitly prefer the provider's registered
     # fast model over the main chat model. Titling is the only eligible task:
@@ -7415,8 +7465,7 @@ def resolve_vision_provider_client(
         #                   live from the catalog — tried when
         #                   DEEPINFRA_API_KEY is set)
         #   5. Stop
-        main_provider = str(runtime.get("provider") or _read_main_provider())
-        main_model = str(runtime.get("model") or _read_main_model())
+        main_provider, main_model = _coherent_main_identity(runtime)
         if main_provider.strip().lower() == "moa":
             # MoA virtual provider: main_model is a preset NAME, and every
             # capability probe below (_PROVIDERS_WITHOUT_VISION,
@@ -7471,6 +7520,17 @@ def resolve_vision_provider_client(
                 logger.debug(
                     "Vision auto-detect: skipping main provider %s (no "
                     "vision support) — falling through to aggregator chain",
+                    main_provider,
+                )
+            elif not vision_model:
+                # Incomplete runtime identity (provider without a model, and
+                # no provider-scoped vision default). Do not let
+                # resolve_provider_client fill the model from config.yaml —
+                # that is the anthropic+gpt-5.2 mix in #96924.
+                logger.debug(
+                    "Vision auto-detect: skipping main provider %s "
+                    "(no coherent model in the runtime snapshot) — "
+                    "falling through to aggregator chain",
                     main_provider,
                 )
             elif not _main_model_supports_vision(main_provider, vision_model):

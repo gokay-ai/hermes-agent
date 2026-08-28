@@ -748,3 +748,128 @@ class TestRateLimitCooldown:
 
         # second call should not have extended the cooldown
         assert second_cooldown == first_cooldown
+
+
+# =============================================================================
+# Auxiliary runtime snapshot after restore (#96924)
+# =============================================================================
+
+class TestRestoreSyncsAuxiliaryRuntime:
+    """After cross-provider fallback restores the primary, vision auto-detect
+    must not build a client for the stale fallback provider.
+    """
+
+    @staticmethod
+    def _pin_zai_primary(agent):
+        agent.model = "glm-5"
+        agent.provider = "zai"
+        agent.requested_provider = "zai"
+        agent.base_url = "https://api.z.ai/api/paas/v4"
+        agent.api_mode = "chat_completions"
+        agent._primary_runtime["model"] = "glm-5"
+        agent._primary_runtime["provider"] = "zai"
+        agent._primary_runtime["requested_provider"] = "zai"
+        agent._primary_runtime["base_url"] = "https://api.z.ai/api/paas/v4"
+        agent._primary_runtime["api_mode"] = "chat_completions"
+        agent._primary_runtime["compressor_model"] = "glm-5"
+        agent._primary_runtime["compressor_provider"] = "zai"
+        agent._primary_runtime["compressor_base_url"] = "https://api.z.ai/api/paas/v4"
+
+    def test_restore_refreshes_aux_snapshot_so_vision_does_not_use_anthropic(self):
+        """Fallback to Anthropic, restore to ZAI, then a vision client request
+        must not construct an Anthropic client for the restored ZAI model.
+
+        Repro for #96924: restore updated agent.provider/model but left the
+        context-local auxiliary snapshot on the fallback provider. Vision
+        auto-detect then mixed that stale provider with a restored/config
+        model and POSTed to api.anthropic.com.
+        """
+        import agent.auxiliary_client as aux
+
+        agent = _make_agent(
+            fallback_model={"provider": "anthropic", "model": "claude-opus-4-6"},
+            provider="zai",
+            base_url="https://api.z.ai/api/paas/v4",
+        )
+        self._pin_zai_primary(agent)
+
+        # Simulate a successful cross-provider fallback without importing the
+        # anthropic SDK (not a core extra; the adapter would otherwise refuse
+        # to activate and leave `_fallback_activated` false).
+        agent._fallback_activated = True
+        agent._fallback_index = 1
+        agent.provider = "anthropic"
+        agent.model = "claude-opus-4-6"
+        agent.base_url = "https://api.anthropic.com"
+        agent.api_mode = "anthropic_messages"
+
+        # Leave the auxiliary snapshot on the fallback provider — the state
+        # restore_primary_runtime used to ignore.
+        aux.set_runtime_main(
+            "anthropic",
+            "claude-opus-4-6",
+            base_url="https://api.anthropic.com",
+            api_key="sk-ant-stale",
+            api_mode="anthropic_messages",
+        )
+
+        zai_client = MagicMock(name="zai_vision_client")
+        zai_client.base_url = "https://api.z.ai/api/paas/v4"
+        captured = []
+
+        def spy_resolve(provider, model=None, *args, **kwargs):
+            captured.append((str(provider or "").strip().lower(), model))
+            if str(provider or "").strip().lower() == "anthropic":
+                raise AssertionError(
+                    "Anthropic client must not be built after restore to ZAI; "
+                    f"got provider={provider!r} model={model!r}"
+                )
+            if str(provider or "").strip().lower() == "zai":
+                return zai_client, model
+            return None, None
+
+        try:
+            with (
+                patch("run_agent.OpenAI", return_value=MagicMock()),
+                patch(
+                    "agent.auxiliary_client._read_main_provider",
+                    return_value="anthropic",
+                ),
+                patch(
+                    "agent.auxiliary_client._read_main_model",
+                    return_value="gpt-5.2-chat-latest",
+                ),
+                patch(
+                    "agent.auxiliary_client._main_model_supports_vision",
+                    return_value=True,
+                ),
+                patch(
+                    "agent.auxiliary_client._resolve_task_provider_model",
+                    return_value=("auto", None, None, None, None),
+                ),
+                patch(
+                    "agent.auxiliary_client.resolve_provider_client",
+                    side_effect=spy_resolve,
+                ),
+                patch(
+                    "agent.auxiliary_client._resolve_strict_vision_backend",
+                    return_value=(None, None),
+                ),
+            ):
+                assert agent._restore_primary_runtime() is True
+                snapshot = aux._normalize_main_runtime(None)
+                assert snapshot.get("provider") == "zai"
+                assert snapshot.get("model") == "glm-5"
+
+                provider, client, model = aux.resolve_vision_provider_client()
+        finally:
+            aux.clear_runtime_main()
+
+        assert agent.provider == "zai"
+        assert agent.model == "glm-5"
+        assert provider == "zai"
+        assert client is zai_client
+        assert not any(p == "anthropic" for p, _ in captured)
+        assert any(p == "zai" for p, _ in captured)
+        # ZAI's dedicated vision default, not the stale Anthropic/config model.
+        assert model == "glm-5v-turbo"

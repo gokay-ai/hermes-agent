@@ -1817,6 +1817,22 @@ def restore_primary_runtime(agent) -> bool:
                 # Notification surfaces are best-effort and must never undo a
                 # successful runtime restoration.
                 pass
+        # Auxiliary auto-detect reads a context-local snapshot that is
+        # otherwise only refreshed in turn_context *after* this returns.
+        # Vision (and other aux tasks) can resolve a client against that
+        # snapshot as soon as the primary is live again — including from
+        # CLI/TUI restore paths that never call turn_context. Rebind it
+        # here so provider/model/base URL/api mode/credential stay atomic
+        # with the restored agent (#96924).
+        try:
+            from agent.auxiliary_client import sync_runtime_main_from_agent
+
+            sync_runtime_main_from_agent(agent)
+        except Exception:
+            logger.debug(
+                "Failed to sync auxiliary runtime after primary restore",
+                exc_info=True,
+            )
         return True
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)

@@ -4681,3 +4681,117 @@ class TestFastModelTier:
             _FAST_MODEL_TASKS
         )
         assert not overlap
+
+
+class TestCoherentMainIdentity:
+    """Provider/model must be filled from one source, never mixed (#96924)."""
+
+    def setup_method(self):
+        import agent.auxiliary_client as aux
+
+        aux.clear_runtime_main()
+        aux.shutdown_cached_clients()
+
+    def teardown_method(self):
+        import agent.auxiliary_client as aux
+
+        aux.clear_runtime_main()
+        aux.shutdown_cached_clients()
+
+    def test_partial_runtime_does_not_pair_stale_provider_with_config_model(self):
+        """Stale runtime provider + config.yaml model must not become Step 1."""
+        import agent.auxiliary_client as aux
+
+        aux.set_runtime_main("anthropic", "")
+        mock_client = MagicMock(name="must_not_be_used")
+
+        with (
+            patch.object(aux, "_read_main_provider", return_value="anthropic"),
+            patch.object(aux, "_read_main_model", return_value="gpt-5.2-chat-latest"),
+            patch.object(
+                aux, "resolve_provider_client", return_value=(mock_client, "gpt-5.2-chat-latest")
+            ) as mock_resolve,
+            patch.object(
+                aux, "_try_configured_fallback_chain", return_value=(None, None, "")
+            ),
+            patch.object(
+                aux, "_try_main_fallback_chain", return_value=(None, None, "")
+            ),
+            patch.object(aux, "_get_provider_chain", return_value=[]),
+        ):
+            client, model, provider = aux._resolve_auto_route()
+
+        mixed = [
+            call
+            for call in mock_resolve.call_args_list
+            if call.args
+            and str(call.args[0]).lower() == "anthropic"
+            and (
+                (len(call.args) > 1 and call.args[1] == "gpt-5.2-chat-latest")
+                or call.kwargs.get("model") == "gpt-5.2-chat-latest"
+            )
+        ]
+        assert mixed == []
+        assert provider != "anthropic"
+        assert client is not mock_client
+        assert model != "gpt-5.2-chat-latest"
+
+    def test_vision_auto_does_not_pair_stale_anthropic_with_config_model(self):
+        """Vision auto-detect must not POST a config model to Anthropic."""
+        import agent.auxiliary_client as aux
+
+        aux.set_runtime_main("anthropic", "")
+        captured = []
+
+        def spy_resolve(provider, model=None, *args, **kwargs):
+            captured.append((str(provider or "").strip().lower(), model))
+            if str(provider or "").strip().lower() == "anthropic":
+                raise AssertionError(
+                    "Anthropic client must not be built for a config-yaml "
+                    f"model; got provider={provider!r} model={model!r}"
+                )
+            return None, None
+
+        with (
+            patch.object(aux, "_read_main_provider", return_value="anthropic"),
+            patch.object(aux, "_read_main_model", return_value="gpt-5.2-chat-latest"),
+            patch.object(aux, "_resolve_task_provider_model", return_value=("auto", None, None, None, None)),
+            patch.object(aux, "_main_model_supports_vision", return_value=True),
+            patch.object(aux, "resolve_provider_client", side_effect=spy_resolve),
+            patch.object(aux, "_resolve_strict_vision_backend", return_value=(None, None)),
+        ):
+            provider, client, model = aux.resolve_vision_provider_client()
+
+        assert not any(p == "anthropic" and m == "gpt-5.2-chat-latest" for p, m in captured)
+        assert not any(p == "anthropic" for p, _ in captured)
+        assert provider != "anthropic"
+
+    def test_complete_runtime_pair_is_used_as_a_unit(self):
+        """A complete runtime snapshot still wins over config.yaml."""
+        import agent.auxiliary_client as aux
+
+        zai_client = MagicMock(name="zai_client")
+        aux.set_runtime_main(
+            "zai",
+            "glm-5",
+            base_url="https://api.z.ai/api/paas/v4",
+            api_key="zai-key",
+            api_mode="chat_completions",
+        )
+
+        def fake_resolve(provider, model=None, *args, **kwargs):
+            if str(provider or "").strip().lower() == "zai" and model == "glm-5":
+                return zai_client, model
+            raise AssertionError(f"unexpected resolve {provider!r} {model!r}")
+
+        with (
+            patch.object(aux, "_read_main_provider", return_value="anthropic"),
+            patch.object(aux, "_read_main_model", return_value="gpt-5.2-chat-latest"),
+            patch.object(aux, "resolve_provider_client", side_effect=fake_resolve),
+            patch.object(aux, "_is_provider_unhealthy", return_value=False),
+        ):
+            client, model, provider = aux._resolve_auto_route()
+
+        assert provider == "zai"
+        assert model == "glm-5"
+        assert client is zai_client
